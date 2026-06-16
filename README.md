@@ -1,5 +1,4 @@
 # LTspice-automation
-# LTspice Op-Amp Batch Automation Tool
 
 A Python automation script for running LTspice simulations in batch, swapping op-amp models dynamically, executing multiple testbenches, and extracting measurement results into structured outputs.
 
