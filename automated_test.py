@@ -1,9 +1,9 @@
-
 import os
 import re
 import shutil
 import subprocess
 import time
+import math
 from tkinter import Tk, filedialog
 
 # ==========================================
@@ -68,9 +68,32 @@ if not master_bench_dir:
 parent_dir = os.path.dirname(master_bench_dir)
 generated_bench_dir = os.path.join(parent_dir, f"generated_runs_{OPAMP_NAME}")
 extracted_logs_dir = os.path.join(parent_dir, f"extracted_logs_{OPAMP_NAME}")
+combined_data_path = os.path.join(parent_dir, "extracted_data.txt")
 
+# Create directories if they don't exist
 os.makedirs(generated_bench_dir, exist_ok=True)
 os.makedirs(extracted_logs_dir, exist_ok=True)
+
+# ==========================================
+# 🧹 CLEANUP STALE DATA FROM PREVIOUS RUNS
+# ==========================================
+print("🧹 Cleaning up old simulation runs and logs to prevent stale results...")
+for folder in [generated_bench_dir, extracted_logs_dir]:
+    for filename in os.listdir(folder):
+        file_path = os.path.join(folder, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print(f"⚠️  Could not delete {file_path}: {e}")
+
+try:
+    if os.path.exists(combined_data_path):
+        os.unlink(combined_data_path)
+except Exception as e:
+    print(f"⚠️  Could not delete {combined_data_path}: {e}")
 
 print(f"\n{'='*60}")
 print(f"  Target Op-Amp   : {OPAMP_NAME}")
@@ -107,7 +130,7 @@ def rewrite_testbench(master_asc_path, dest_asc_path):
             print(f"❌ Still cannot write: {e}. Skipping.")
             return False
 
-    with open(dest_asc_path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open(dest_asc_path, "r", encoding="latin-1", errors="ignore") as fh:
         lines = fh.readlines()
 
     out_lines = []
@@ -146,7 +169,7 @@ def rewrite_testbench(master_asc_path, dest_asc_path):
         lib_line = f'TEXT 0 -200 Left 2 !.lib "{OPAMP_CIR_PATH}"\n'
         out_lines.append(lib_line)
 
-    with open(dest_asc_path, "w", encoding="utf-8") as fh:
+    with open(dest_asc_path, "w", encoding="latin-1", newline="\n") as fh:
         fh.writelines(out_lines)
 
     return True
@@ -176,32 +199,80 @@ def run_simulation(dest_asc_path):
 # ==========================================
 # 🎬 SIMULATION RUNNER (AUTOMATIC)
 # ==========================================
-def run_simulation_auto(dest_asc_path, timeout_sec=60):
+def run_simulation_auto(dest_asc_path, timeout_sec=120):
     """
-    Launches LTspice in batch mode so the schematic runs automatically.
-    Returns the path to the generated .log file, or None if not found.
+    Launches LTspice in headless batch mode (-b flag).
+    Blocks until LTspice exits, then returns the .log path.
     """
     bench_name = os.path.basename(dest_asc_path)
-    print(f"\n🎬  Auto-running LTspice → {bench_name}")
+    print(f"\n🎬  Auto-running → {bench_name}")
 
     try:
         subprocess.run(
-            [LTSPICE_EXE, "-b", "-run", dest_asc_path],
+            [LTSPICE_EXE, "-b", dest_asc_path],
             cwd=os.path.dirname(dest_asc_path),
             check=False,
+            timeout=timeout_sec,
         )
+    except subprocess.TimeoutExpired:
+        print(f"⚠️   LTspice timed out after {timeout_sec}s for {bench_name}")
     except Exception as e:
-        print(f"❌ LTspice batch run failed for {bench_name}: {e}")
+        print(f"❌  LTspice failed for {bench_name}: {e}")
         return None
 
     log_path = os.path.splitext(dest_asc_path)[0] + ".log"
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        if os.path.exists(log_path):
-            return log_path
-        time.sleep(0.5)
+    if os.path.exists(log_path):
+        return log_path
 
     print(f"⚠️   No .log found for {bench_name} after batch run.")
+    return None
+
+
+def run_simulation_fourier(dest_asc_path, timeout_sec=120):
+    """
+    Runs a .four/.tran bench in batch mode with -ascii flag.
+    LTspice 26+ writes Fourier results into the .log in batch+ascii mode.
+    Falls back to interactive if log doesn't contain Fourier results.
+    """
+    bench_name = os.path.basename(dest_asc_path)
+    print(f"\n🎬  Auto-running (Fourier) → {bench_name}")
+
+    log_path = os.path.splitext(dest_asc_path)[0] + ".log"
+
+    # Remove stale log so we can detect fresh output
+    if os.path.exists(log_path):
+        os.remove(log_path)
+
+    try:
+        subprocess.run(
+            [LTSPICE_EXE, "-b", "-ascii", dest_asc_path],
+            cwd=os.path.dirname(dest_asc_path),
+            check=False,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"⚠️   LTspice timed out after {timeout_sec}s")
+    except Exception as e:
+        print(f"❌  LTspice failed: {e}")
+        return None
+
+    if os.path.exists(log_path):
+        content = open(log_path, "r", encoding="utf-8", errors="ignore").read()
+        if "Fourier components" in content or "Total Harmonic Distortion" in content:
+            print("    ✅ Fourier results found in log")
+            return log_path
+        else:
+            print("    ⚠️  Batch ran but no Fourier output in log")
+            print("    Falling back to interactive mode...")
+
+    # Fallback: open interactively, user runs it manually
+    print("    📌 Click Run ▶ in LTspice, then close the window when done.")
+    subprocess.run([LTSPICE_EXE, dest_asc_path])
+
+    if os.path.exists(log_path):
+        return log_path
+
+    print(f"⚠️   No .log found for {bench_name}.")
     return None
 
 
@@ -231,6 +302,18 @@ def save_extracted_log(data_text, bench_name):
     print(f"💾  Saved → {out_path}")
     return out_path
 
+
+
+def append_combined_extracted_data(data_text, bench_name):
+    """Appends extracted measurement data to one combined summary file."""
+    stem = os.path.splitext(bench_name)[0]
+    with open(combined_data_path, "a", encoding="utf-8") as fh:
+        fh.write(f"\n{'='*80}\n")
+        fh.write(f"{OPAMP_NAME} — {stem}\n")
+        fh.write(f"{'='*80}\n")
+        fh.write(data_text)
+        if not data_text.endswith("\n"):
+            fh.write("\n")
 
 # ==========================================
 # 🔢 NUMBER FORMATTING
@@ -306,6 +389,38 @@ def format_numbers_in_text(text):
 
 
 # ==========================================
+# 📊 THD EXTRACTOR
+# ==========================================
+def extract_thd(text):
+    """
+    Extract Total Harmonic Distortion (%) from LTspice .four output.
+    Returns (thd_percent, thd_db) or (None, None) if missing/unparseable.
+    """
+    m = re.search(
+        r"Total Harmonic Distortion:\s*([0-9.+\-eE]+)\s*%",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None, None
+
+    try:
+        thd_percent = float(m.group(1))
+    except (TypeError, ValueError):
+        return None, None
+
+    if thd_percent <= 0:
+        return thd_percent, None
+
+    try:
+        thd_db = 20 * math.log10(thd_percent / 100.0)
+    except (ValueError, OverflowError):
+        thd_db = None
+
+    return thd_percent, thd_db
+
+
+# ==========================================
 # 📊 LOG READER
 # ==========================================
 def parse_all_from_text(text):
@@ -331,7 +446,20 @@ def parse_all_from_text(text):
     while i < len(lines):
         line = lines[i].strip()
 
-        # Format 1: Measurement: <name>
+        # THD line: "Total Harmonic Distortion: 0.002406%"
+        thd_m = re.match(
+            r"^Total Harmonic Distortion[:\s]+"
+            r"([+-]?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*%",
+            line, re.IGNORECASE
+        )
+        if thd_m:
+            thd_pct = float(thd_m.group(1))
+            add_result("THD_%", str(thd_pct))
+            if thd_pct > 0:
+                thd_db = 20 * math.log10(thd_pct / 100.0)
+                add_result("THD_dB", f"{thd_db:.4f}")
+            i += 1
+            continue
         m = re.match(r"^Measurement:\s*(\S+)", line, re.IGNORECASE)
         if m:
             meas_name = m.group(1)
@@ -424,6 +552,7 @@ def display_all_results():
             text = fh.read()
 
         measurements = parse_all_from_text(text)
+        thd_percent, thd_db = extract_thd(text)
         formatted_text = format_numbers_in_text(text)
 
         print(f"\n  ┌─ {bench_label}")
@@ -433,6 +562,11 @@ def display_all_results():
                 print(f"  │   {name:<30} = {_engineering_string(val)}")
         else:
             print("  │   (no parsed measurement pairs found)")
+
+        if thd_percent is not None:
+            print(f"  │   {'THD (%)':<30} = {thd_percent:.6f}")
+            if thd_db is not None:
+                print(f"  │   {'THD (dB)':<30} = {thd_db:.2f}")
 
         print("  │")
         print("  │   Full log text:")
@@ -461,6 +595,8 @@ if __name__ == "__main__":
     print(f"🔎 Found {len(all_benches)} testbench(es): {', '.join(all_benches)}\n")
 
     for bench_file in all_benches:
+      
+
         print(f"\n{'─'*60}")
         print(f"📋  Processing: {bench_file}")
 
@@ -472,8 +608,13 @@ if __name__ == "__main__":
             print(f"⏩  Skipping {bench_file} (write error).")
             continue
 
-        # Automatic LTspice run
-        log_path = run_simulation_auto(dest_path)
+        # THD/Fourier bench: try batch+ascii first, fall back to interactive
+        is_thd = "harmonic" in bench_file.lower() or "thd" in bench_file.lower()
+
+        if is_thd:
+            log_path = run_simulation_fourier(dest_path)
+        else:
+            log_path = run_simulation_auto(dest_path)
         if not log_path:
             continue
 
@@ -483,5 +624,6 @@ if __name__ == "__main__":
             continue
 
         save_extracted_log(data_text, bench_file)
+        append_combined_extracted_data(data_text, bench_file)
 
     display_all_results()
